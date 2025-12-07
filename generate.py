@@ -76,10 +76,13 @@ def main(args):
         config = dictdot(json.load(f))
 
     # Load model:
-    if config.vae == "f8d4":
+    if config.vae == "f8d4" or config.vae == "f8d4flow":
         latent_size = config.resolution // 8
         in_channels = 4
-    elif config.vae == "f16d32":
+    elif config.vae == "flux" or config.vae == "fluxflow" or config.vae == "wan" or config.vae == "wanflow" or config.vae == "sd3" or config.vae == "sd3flow":
+        latent_size = config.resolution // 8
+        in_channels = 16
+    elif config.vae == "f16d32" or config.vae == "f16d32flow":
         latent_size = config.resolution // 16
         in_channels = 32
     else:
@@ -122,8 +125,11 @@ def main(args):
         latents_bias = state_dict["ema"]["bn.running_mean"].view(1, in_channels, 1, 1).to(device)
     else:
         # LDM-training-only checkpoints, VAE checkpoint should be in the config
-        vae_state_dict = torch.load(config.vae_ckpt, map_location=f"cuda:{device}")
-
+        if os.path.exists(config.vae_ckpt):
+            vae_state_dict = torch.load(config.vae_ckpt, map_location=f"cuda:{device}")
+        else:
+            vae_state_dict = None
+            print("VAE ckpt do not exist: ", config.vae_ckpt)
         latents_stats = torch.load(
             config.vae_ckpt.replace(".pt", "-latents-stats.pt"),
             map_location=f"cuda:{device}"
@@ -132,10 +138,11 @@ def main(args):
         latents_bias = latents_stats["latents_bias"].to(device)
         del latents_stats
 
-    vae.load_state_dict(vae_state_dict)
+    if vae_state_dict is not None:
+        vae.load_state_dict(vae_state_dict)
     vae.eval()
 
-    del state_dict, vae_state_dict
+    del state_dict
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -217,7 +224,20 @@ def main(args):
     dist.barrier()
     if rank == 0:
         create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
-        print("Done.")
+        print("create npz done.")
+        from calculate_fid import calculate_fid_given_paths
+        fid_num = args.num_fid_samples
+        print('Calculating FID with {} number of samples'.format(fid_num))
+        fid_reference_file = '/workspace/cogview_dev/xutd/xu/LightningDiT/VIRTUAL_imagenet256_labeled.npz'
+        fid = calculate_fid_given_paths(
+            [fid_reference_file, sample_folder_dir],
+            batch_size=50,
+            dims=2048,
+            device='cuda',
+            num_workers=8,
+            sp_len = fid_num
+        )
+        print('fid=',fid)
     dist.barrier()
     dist.destroy_process_group()
 

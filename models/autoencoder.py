@@ -7,6 +7,8 @@ from dictdot import dictdot
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+from omegaconf import OmegaConf
 
 
 def nonlinearity(x):
@@ -93,7 +95,7 @@ class ResnetBlock(nn.Module):
                     in_channels, out_channels, kernel_size=1, stride=1, padding=0
                 )
 
-    def forward(self, x, temb):
+    def _forward(self, x, temb):
         h = x
         h = self.norm1(h)
         h = nonlinearity(h)
@@ -114,6 +116,9 @@ class ResnetBlock(nn.Module):
                 x = self.nin_shortcut(x)
 
         return x + h
+
+    def forward(self, x, temb):
+        return checkpoint(self._forward, x, temb, use_reentrant=False)
 
 
 class AttnBlock(nn.Module):
@@ -177,6 +182,7 @@ class Encoder(nn.Module):
         resolution=256,
         z_channels=16,
         double_z=True,
+        mid_attn=True,
         **ignore_kwargs,
     ):
         super().__init__()
@@ -228,7 +234,9 @@ class Encoder(nn.Module):
             temb_channels=self.temb_ch,
             dropout=dropout,
         )
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid_attn = mid_attn
+        if self.mid_attn:
+            self.mid.attn_1 = AttnBlock(block_in)
         self.mid.block_2 = ResnetBlock(
             in_channels=block_in,
             out_channels=block_in,
@@ -266,7 +274,8 @@ class Encoder(nn.Module):
         # middle
         h = hs[-1]
         h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
+        if self.mid_attn:
+            h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)
 
         # end
@@ -291,6 +300,7 @@ class Decoder(nn.Module):
         resolution=256,
         z_channels=16,
         give_pre_end=False,
+        mid_attn=True,
         **ignore_kwargs,
     ):
         super().__init__()
@@ -326,7 +336,9 @@ class Decoder(nn.Module):
             temb_channels=self.temb_ch,
             dropout=dropout,
         )
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid_attn = mid_attn
+        if self.mid_attn:
+            self.mid.attn_1 = AttnBlock(block_in)
         self.mid.block_2 = ResnetBlock(
             in_channels=block_in,
             out_channels=block_in,
@@ -378,7 +390,8 @@ class Decoder(nn.Module):
 
         # middle
         h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
+        if self.mid_attn:
+            h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)
 
         # upsampling
@@ -448,27 +461,197 @@ class DiagonalGaussianDistribution(object):
     def mode(self):
         return self.mean
 
+import INN
+import INN.INNAbstract as INNAbstract
+from INN.CouplingModels.conv import CouplingConv
+from INN.CouplingModels.utils import _default_2d_coupling_function
+
+class PixelUnshuffle2d(INNAbstract.PixelShuffleModule):
+    def __init__(self, r):
+        super(PixelUnshuffle2d, self).__init__()
+        self.r = r
+        self.shuffle = nn.PixelShuffle(r)
+        self.unshuffle = nn.PixelUnshuffle(r)
+    
+    def PixelShuffle(self, x):
+        return self.unshuffle(x)
+    
+    def PixelUnshuffle(self, x):
+        return self.shuffle(x)
+
+class residual_2d_coupling_function(nn.Module):
+    def __init__(self, channels, kernel_size, activation_fn=nn.ReLU, w=4):
+        super(residual_2d_coupling_function, self).__init__()
+        if kernel_size % 2 != 1:
+            raise ValueError(f'kernel_size must be an odd number, but got {kernel_size}')
+        r = kernel_size // 2
+
+        self.activation_fn = activation_fn
+        
+        self.f = nn.Sequential(nn.Conv2d(channels, channels * w, kernel_size, padding=r),
+                               activation_fn(),
+                               nn.Conv2d(w * channels, w * channels, kernel_size, padding=r),
+                               activation_fn(),
+                               nn.Conv2d(w * channels, channels, kernel_size, padding=r)
+                              )
+        self.f.apply(self._init_weights)
+        for name, param in self.f.named_parameters():
+            if "4.weight" in name:
+                torch.nn.init.zeros_(param.data)
+    
+    def _init_weights(self, m):
+        
+        if type(m) == nn.Conv2d:
+            # doing xavier initialization
+            # NOTE: Kaiming initialization will make the output too high, which leads to nan
+            torch.nn.init.xavier_uniform_(m.weight.data)
+            # torch.nn.init.zeros_(m.weight.data)
+            torch.nn.init.zeros_(m.bias.data)
+
+    def forward(self, x):
+        return self.f(x) + x
+
+from INN.CouplingModels.conv import CouplingConv
+
+class ResConvNICE(CouplingConv):
+    '''
+    1-d invertible convolution layer by NICE method
+    '''
+    def __init__(self, channels, kernel_size, w=4, activation_fn=nn.ReLU, mask=None):
+        super(ResConvNICE, self).__init__(num_feature=channels, mask=mask)
+        self.m1 = None
+        self.m2 = None
+    
+    def forward(self, x):
+        mask = self.working_mask(x)
+        
+        x_ = mask * x
+        x = x + (1-mask) * self.m1(x_)
+        
+        x_ = (1-mask) * x
+        x = x + mask * self.m2(x_)
+        return x
+    
+    def inverse(self, y):
+        mask = self.working_mask(y)
+        
+        y_ = (1-mask) * y
+        y = y - mask * self.m2(y_)
+        
+        y_ = mask * y
+        y = y - (1-mask) * self.m1(y_)
+        
+        return y
+    
+    def logdet(self, **args):
+        return 0
+
+class ResConv2dNICE(ResConvNICE):
+    '''
+    1-d invertible convolution layer by NICE method
+    '''
+    def __init__(self, channels, kernel_size, w=4, activation_fn=nn.ReLU, mask=None):
+        super(ResConv2dNICE, self).__init__(channels, kernel_size, w=w, activation_fn=activation_fn, mask=mask)
+        self.kernel_size = kernel_size
+        self.m1 = residual_2d_coupling_function(channels, kernel_size, activation_fn, w=w)
+        self.m2 = residual_2d_coupling_function(channels, kernel_size, activation_fn, w=w)
+
+    def forward(self, x, log_p0=0, log_det_J=0):
+        y = super(ResConv2dNICE, self).forward(x)
+        if self.compute_p:
+            return y, log_p0, log_det_J + self.logdet()
+        else:
+            return y
+    
+    def inverse(self, y, **args):
+        x = super(ResConv2dNICE, self).inverse(y)
+        return x
+    
+    def __repr__(self):
+        return f'Conv2dNICE(channels={self.num_feature}, kernel_size={self.kernel_size})'
 
 class AutoencoderKL(nn.Module):
-    def __init__(self, embed_dim, ch_mult, use_variational=True):
+    def __init__(self, embed_dim, ch_mult, num_res_blocks=2, use_variational=True, use_flow=False, use_pre_post=True, mid_attn=True):
         super().__init__()
-        self.encoder = Encoder(ch_mult=ch_mult, z_channels=embed_dim)
-        self.decoder = Decoder(ch_mult=ch_mult, z_channels=embed_dim)
+        self.encoder = Encoder(ch_mult=ch_mult, num_res_blocks=num_res_blocks, z_channels=embed_dim, mid_attn=mid_attn)
+        self.decoder = Decoder(ch_mult=ch_mult, num_res_blocks=num_res_blocks, z_channels=embed_dim, mid_attn=mid_attn)
         self.use_variational = use_variational
         mult = 2 if self.use_variational else 1
-        self.quant_conv = torch.nn.Conv2d(2 * embed_dim, mult * embed_dim, 1)
-        self.post_quant_conv = torch.nn.Conv2d(embed_dim, embed_dim, 1)
+        if use_pre_post:
+            self.quant_conv = torch.nn.Conv2d(2 * embed_dim, mult * embed_dim, 1)
+            self.post_quant_conv = torch.nn.Conv2d(embed_dim, embed_dim, 1)
+        else:
+            self.quant_conv = torch.nn.Identity()
+            self.post_quant_conv = torch.nn.Identity()
+        self.use_flow = use_flow
+        if self.use_flow:
+            flow_layers = 6
+            if flow_layers == 10:
+                print("flow 10!")
+                self.flow = INN.Sequential(
+                    ResConv2dNICE(embed_dim, 3), # 16
+                    INN.PixelShuffle2d(2), # 8
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    INN.PixelShuffle2d(2), # 4
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    INN.PixelShuffle2d(2), # 2
+                    ResConv2dNICE(embed_dim * 64, 3, w=1),
+                    INN.PixelShuffle2d(2), # 1
+                    ResConv2dNICE(embed_dim * 256, 1, w=1),
+                    ResConv2dNICE(embed_dim * 256, 1, w=1),
+                    PixelUnshuffle2d(2), # 1
+                    ResConv2dNICE(embed_dim * 64, 3, w=1),
+                    PixelUnshuffle2d(2), # 2
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim, 3),
+                )
+            elif flow_layers == 6:
+                # 64
+                print("flow 6!")
+                self.flow = INN.Sequential(
+                    ResConv2dNICE(embed_dim, 3), # 16
+                    INN.PixelShuffle2d(2), # 8
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    INN.PixelShuffle2d(2), # 4
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim, 3),
+                )
+            elif flow_layers == 1:
+                print("flow 1!")
+                self.flow = INN.Sequential(
+                    ResConv2dNICE(embed_dim, 3), # 16
+                )
+            else:
+                assert(0)
+            self.flow.computing_p(True)
+            self.flow_lam = 1
 
-    def encode(self, x):
+    def encode(self, x, sample=False):
         h = self.encoder(x)
         moments = self.quant_conv(h)
         if not self.use_variational:
             moments = torch.cat((moments, torch.ones_like(moments)), 1)
         posterior = DiagonalGaussianDistribution(moments)
-        return posterior
+        if sample:
+            z = posterior.sample()
+            if self.use_flow:
+                return self.flow(z)[0]
+            else:
+                return z
+        else:
+            return posterior
 
     def decode(self, z):
         # NOTE: We wrap the output in a dict to be consistent with the output
+        if self.use_flow:
+            z = self.flow.inverse(z)
         z = self.post_quant_conv(z)
         dec = self.decoder(z)
         return dictdot(dict(sample=dec))
@@ -477,10 +660,137 @@ class AutoencoderKL(nn.Module):
         posterior = self.encode(x)
         z = posterior.sample()
 
+        if self.use_flow:
+            z1 = z
+            z, logpz, logdet = self.flow(z1)
+            if self.training:
+                # z2 = self.flow.inverse(z)
+                z_loss = torch.mean(z**2)
+                z_loss_target = torch.mean(z1**2).detach()                
+                return posterior, z, logdet, z_loss, z_loss_target
+
         recon = None
         if return_recon:
             recon = self.decode(z).sample
         return posterior, z, recon
+
+class AutoencoderPIT(nn.Module):
+    def __init__(self, pit_config, use_flow=False):
+        super().__init__()
+        from pit.util import instantiate_from_config
+        config = OmegaConf.load(pit_config)
+        self.model = instantiate_from_config(config.model)
+        self.use_flow = use_flow
+        if self.use_flow:
+            embed_dim = 16
+            flow_layers = 6
+            if flow_layers == 10:
+                print("flow 10!")
+                self.flow = INN.Sequential(
+                    ResConv2dNICE(embed_dim, 3), # 16
+                    INN.PixelShuffle2d(2), # 8
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    INN.PixelShuffle2d(2), # 4
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    INN.PixelShuffle2d(2), # 2
+                    ResConv2dNICE(embed_dim * 64, 3, w=1),
+                    INN.PixelShuffle2d(2), # 1
+                    ResConv2dNICE(embed_dim * 256, 1, w=1),
+                    ResConv2dNICE(embed_dim * 256, 1, w=1),
+                    PixelUnshuffle2d(2), # 1
+                    ResConv2dNICE(embed_dim * 64, 3, w=1),
+                    PixelUnshuffle2d(2), # 2
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim, 3),
+                )
+            elif flow_layers == 6:
+                # 64
+                print("flow 6!")
+                self.flow = INN.Sequential(
+                    ResConv2dNICE(embed_dim, 3), # 16
+                    INN.PixelShuffle2d(2), # 8
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    INN.PixelShuffle2d(2), # 4
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    ResConv2dNICE(embed_dim * 16, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim * 4, 3),
+                    PixelUnshuffle2d(2),
+                    ResConv2dNICE(embed_dim, 3),
+                )
+            elif flow_layers == 4:
+                # 64
+                print("flow 4!")
+                self.flow = INN.Sequential(
+                    ResConv2dNICE(embed_dim, 3),
+                    ResConv2dNICE(embed_dim, 3),
+                    ResConv2dNICE(embed_dim, 3),
+                    ResConv2dNICE(embed_dim, 3),
+                )
+            elif flow_layers == 1:
+                print("flow 1!")
+                self.flow = INN.Sequential(
+                    ResConv2dNICE(embed_dim, 3), # 16
+                )
+            else:
+                assert(0)
+            self.flow.computing_p(True)
+            self.flow_lam = 1
+
+    def encode(self, x, sample=False):
+        with torch.no_grad():
+            z, _ = self.model.encode(x, return_reg_log=True)
+        if sample:
+            if self.use_flow:
+                return self.flow(z)[0]
+            else:
+                return z
+        else:
+            return z
+
+    def decode(self, z):
+        # NOTE: We wrap the output in a dict to be consistent with the output
+        if self.use_flow:
+            z = self.flow.inverse(z)
+        with torch.no_grad():
+            dec = self.model.decode(z)
+        return dictdot(dict(sample=dec))
+
+    def forward(self, x, return_recon=True):
+        z = self.encode(x)
+        posterior = None
+
+        if self.use_flow:
+            z1 = z
+            z, logpz, logdet = self.flow(z1)
+            if self.training:
+                z_loss = torch.mean(z**2,dim=(1,2,3))
+                z_loss_target = torch.mean(z1**2,dim=(1,2,3)).detach()                
+                return posterior, z, logdet, z_loss, z_loss_target
+
+        recon = None
+        if return_recon:
+            recon = self.decode(z).sample
+        return posterior, z, recon
+
+    def get_grad_norm(self, loss):
+        norm = 0
+        for name, param in self.flow.named_parameters():
+            if "9." not in name:
+                continue
+            if "weight" not in name:
+                continue
+            if "m1" not in name:
+                continue
+            if "f.4." not in name:
+                continue
+            grad = torch.autograd.grad(loss, param, retain_graph=True)[0]
+            norm += torch.norm(grad)
+            
+        return norm
 
 
 # Predefined VAE architectures
@@ -488,13 +798,61 @@ def VAE_F8D4(**kwargs):
     # [B, 4, 32, 32]
     return AutoencoderKL(embed_dim=4, ch_mult=[1, 2, 4, 4], use_variational=True, **kwargs)
 
+def VAE_F8D4Flow(**kwargs):
+    # [B, 4, 32, 32]
+    return AutoencoderKL(embed_dim=4, ch_mult=[1, 2, 4, 4], use_variational=True, use_flow=True, **kwargs)
+
+def VAE_F8D16(**kwargs):
+    # [B, 16, 32, 32]
+    return AutoencoderKL(embed_dim=16, ch_mult=[1, 4, 8, 8], num_res_blocks=3, use_variational=True, use_pre_post=False, mid_attn=False, **kwargs)
+
+def VAE_F8D16Flow(**kwargs):
+    # [B, 16, 32, 32]
+    return AutoencoderKL(embed_dim=16, ch_mult=[1, 4, 8, 8], num_res_blocks=3, use_variational=True, use_flow=True, use_pre_post=False, mid_attn=False, **kwargs)
 
 def VAE_F16D32(**kwargs):
     # [B, 32, 16, 16] (used in VA-VAE and our model)
     return AutoencoderKL(embed_dim=32, ch_mult=[1, 1, 2, 2, 4], use_variational=True, **kwargs)
 
+def VAE_F16D32Flow(**kwargs):
+    # [B, 32, 16, 16] (used in VA-VAE and our model)
+    return AutoencoderKL(embed_dim=32, ch_mult=[1, 1, 2, 2, 4], use_variational=True, use_flow=True, **kwargs)
+
+def VAE_FLUX(**kwargs):
+    return AutoencoderPIT("/workspace/cogview_dev/xutd/xu/pytorch-image-tokenizer/configs/FLUX.yaml")
+
+def VAE_FLUXFlow(**kwargs):
+    return AutoencoderPIT("/workspace/cogview_dev/xutd/xu/pytorch-image-tokenizer/configs/FLUX.yaml", use_flow=True)
+
+def VAE_SD3(**kwargs):
+    return AutoencoderPIT("/workspace/cogview_dev/xutd/xu/pytorch-image-tokenizer/configs/SD3.yaml")
+
+def VAE_SD3Flow(**kwargs):
+    return AutoencoderPIT("/workspace/cogview_dev/xutd/xu/pytorch-image-tokenizer/configs/SD3.yaml", use_flow=True)
+
+def VAE_WAN(**kwargs):
+    return AutoencoderPIT("/workspace/cogview_dev/xutd/xu/pytorch-image-tokenizer/configs/Wan2.2-I2V-A14B-Diffusers.yaml")
+
+def VAE_WANFlow(**kwargs):
+    return AutoencoderPIT("/workspace/cogview_dev/xutd/xu/pytorch-image-tokenizer/configs/Wan2.2-I2V-A14B-Diffusers.yaml", use_flow=True)
 
 vae_models = {
     "f8d4": VAE_F8D4, # [B, 4, 32, 32]
+    "f8d4flow": VAE_F8D4Flow, # [B, 4, 32, 32]
+    "f8d16": VAE_F8D16, # [B, 4, 32, 32]
+    "f8d16flow": VAE_F8D16Flow, # [B, 4, 32, 32]
     "f16d32": VAE_F16D32, # [B, 32, 16, 16]
+    "f16d32flow": VAE_F16D32Flow, # [B, 32, 16, 16]
+    "flux": VAE_FLUX, # [B, 32, 16, 16]
+    "fluxflow": VAE_FLUXFlow, # [B, 32, 16, 16]
+    "sd3": VAE_SD3, # [B, 32, 16, 16]
+    "sd3flow": VAE_SD3Flow, # [B, 32, 16, 16]
+    "wan": VAE_WAN, # [B, 32, 16, 16]
+    "wanflow": VAE_WANFlow, # [B, 32, 16, 16]
+
 }
+
+if __name__ == "__main__":
+    model = VAE_F8D4()
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total number of parameters: {total_params}")

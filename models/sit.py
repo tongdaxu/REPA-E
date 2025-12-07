@@ -11,7 +11,115 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+import torch.utils.checkpoint as checkpoint
+import INN
+import INN.INNAbstract as INNAbstract
+from INN.CouplingModels.conv import CouplingConv
+from INN.CouplingModels.utils import _default_2d_coupling_function
 
+class PixelUnshuffle2d(INNAbstract.PixelShuffleModule):
+    def __init__(self, r):
+        super(PixelUnshuffle2d, self).__init__()
+        self.r = r
+        self.shuffle = nn.PixelShuffle(r)
+        self.unshuffle = nn.PixelUnshuffle(r)
+    
+    def PixelShuffle(self, x):
+        return self.unshuffle(x)
+    
+    def PixelUnshuffle(self, x):
+        return self.shuffle(x)
+
+class residual_2d_coupling_function(nn.Module):
+    def __init__(self, channels, kernel_size, activation_fn=nn.ReLU, w=4):
+        super(residual_2d_coupling_function, self).__init__()
+        if kernel_size % 2 != 1:
+            raise ValueError(f'kernel_size must be an odd number, but got {kernel_size}')
+        r = kernel_size // 2
+
+        self.activation_fn = activation_fn
+        
+        self.f = nn.Sequential(nn.Conv2d(channels, channels * w, kernel_size, padding=r),
+                               activation_fn(),
+                               nn.Conv2d(w * channels, w * channels, kernel_size, padding=r),
+                               activation_fn(),
+                               nn.Conv2d(w * channels, channels, kernel_size, padding=r)
+                              )
+        self.f.apply(self._init_weights)
+        for name, param in self.f.named_parameters():
+            if "4.weight" in name:
+                torch.nn.init.zeros_(param.data)
+    
+    def _init_weights(self, m):
+        
+        if type(m) == nn.Conv2d:
+            # doing xavier initialization
+            # NOTE: Kaiming initialization will make the output too high, which leads to nan
+            torch.nn.init.xavier_uniform_(m.weight.data)
+            # torch.nn.init.zeros_(m.weight.data)
+            torch.nn.init.zeros_(m.bias.data)
+
+    def forward(self, x):
+        return self.f(x) + x
+
+from INN.CouplingModels.conv import CouplingConv
+
+class ResConvNICE(CouplingConv):
+    '''
+    1-d invertible convolution layer by NICE method
+    '''
+    def __init__(self, channels, kernel_size, w=4, activation_fn=nn.ReLU, mask=None):
+        super(ResConvNICE, self).__init__(num_feature=channels, mask=mask)
+        self.m1 = None
+        self.m2 = None
+    
+    def forward(self, x):
+        mask = self.working_mask(x)
+        
+        x_ = mask * x
+        x = x + (1-mask) * self.m1(x_)
+        
+        x_ = (1-mask) * x
+        x = x + mask * self.m2(x_)
+        return x
+    
+    def inverse(self, y):
+        mask = self.working_mask(y)
+        
+        y_ = (1-mask) * y
+        y = y - mask * self.m2(y_)
+        
+        y_ = mask * y
+        y = y - (1-mask) * self.m1(y_)
+        
+        return y
+    
+    def logdet(self, **args):
+        return 0
+
+class ResConv2dNICE(ResConvNICE):
+    '''
+    1-d invertible convolution layer by NICE method
+    '''
+    def __init__(self, channels, kernel_size, w=4, activation_fn=nn.ReLU, mask=None):
+        super(ResConv2dNICE, self).__init__(channels, kernel_size, w=w, activation_fn=activation_fn, mask=mask)
+        self.kernel_size = kernel_size
+        self.m1 = residual_2d_coupling_function(channels, kernel_size, activation_fn, w=w)
+        self.m2 = residual_2d_coupling_function(channels, kernel_size, activation_fn, w=w)
+
+    def forward(self, x, log_p0=0, log_det_J=0):
+        y = super(ResConv2dNICE, self).forward(x)
+        if self.compute_p:
+            return y, log_p0, log_det_J + self.logdet()
+        else:
+            return y
+    
+    def inverse(self, y, **args):
+        x = super(ResConv2dNICE, self).inverse(y)
+        return x
+    
+    def __repr__(self):
+        return f'Conv2dNICE(channels={self.num_feature}, kernel_size={self.kernel_size})'
 
 def mean_flat(x):
     """
@@ -165,6 +273,32 @@ class FinalLayer(nn.Module):
         return x
 
 
+def expand_t_like_x(t, x_cur):
+    dims = [1] * (len(x_cur.size()) - 1)
+    t = t.view(t.size(0), *dims)
+    return t
+
+
+def get_score_from_velocity(vt, xt, t, path_type="linear", eps=0.0):
+    t = expand_t_like_x(t, xt)
+    if path_type == "linear":
+        alpha_t, d_alpha_t = 1 - t, torch.ones_like(xt, device=xt.device) * -1
+        sigma_t, d_sigma_t = t, torch.ones_like(xt, device=xt.device)
+    elif path_type == "cosine":
+        alpha_t = torch.cos(t * np.pi / 2)
+        sigma_t = torch.sin(t * np.pi / 2)
+        d_alpha_t = -np.pi / 2 * torch.sin(t * np.pi / 2)
+        d_sigma_t =  np.pi / 2 * torch.cos(t * np.pi / 2)
+    else:
+        raise NotImplementedError
+
+    mean = xt
+    reverse_alpha_ratio = alpha_t / d_alpha_t
+    var = sigma_t**2 - reverse_alpha_ratio * d_sigma_t * sigma_t
+    score = (reverse_alpha_ratio * vt - mean) / (var + eps)
+
+    return score
+
 class SiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
@@ -186,6 +320,7 @@ class SiT(nn.Module):
         z_dims=[768],
         projector_dim=2048,
         bn_momentum=0.1,
+        use_flow=False,
         **block_kwargs # fused_attn
     ):
         super().__init__()
@@ -219,6 +354,22 @@ class SiT(nn.Module):
             in_channels, eps=1e-4, momentum=bn_momentum, affine=False, track_running_stats=True
         )
         self.bn.reset_running_stats()
+        self.use_flow = use_flow
+        if self.use_flow:
+            self.flow = INN.Sequential(
+                ResConv2dNICE(in_channels, 3), # 16
+                INN.PixelShuffle2d(2), # 8
+                ResConv2dNICE(in_channels * 4, 3),
+                INN.PixelShuffle2d(2), # 4
+                ResConv2dNICE(in_channels * 16, 3),
+                ResConv2dNICE(in_channels * 16, 3),
+                PixelUnshuffle2d(2),
+                ResConv2dNICE(in_channels * 4, 3),
+                PixelUnshuffle2d(2),
+                ResConv2dNICE(in_channels, 3),
+            )
+            self.flow.computing_p(True)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -303,6 +454,12 @@ class SiT(nn.Module):
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
+    def custom(self, module):
+        def custom_forward(*inputs):
+            inputs = module(inputs[0], inputs[1])
+            return inputs
+        return custom_forward
+
     def forward(self, x, y, zs, loss_kwargs, time_input=None, noises=None):
         """
         Forward pass of SiT, integrating the loss function computation
@@ -316,6 +473,13 @@ class SiT(nn.Module):
         """
         # Normalize the input x with batch norm running stats
         normalized_x = self.bn(x)
+
+        if self.use_flow:
+            new_x, _, _ = self.flow(normalized_x)
+            if self.training:
+                z_loss = torch.mean(new_x**2)
+                z_loss_target = torch.mean(normalized_x**2).detach()                
+            normalized_x = new_x
 
         # sample timesteps if not provided
         if time_input is None:
@@ -357,6 +521,8 @@ class SiT(nn.Module):
         c = t_embed + y                                       # (N, D)
 
         for i, block in enumerate(self.blocks):
+            # checkpoint
+            # x = checkpoint.checkpoint(block, x, c, use_reentrant=False)
             x = block(x, c)                                   # (N, T, D)
             if (i + 1) == self.encoder_depth:
                 zs_tilde = [projector(x.reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
@@ -367,7 +533,13 @@ class SiT(nn.Module):
         x = self.unpatchify(x)                                # (N, out_channels, H, W)
 
         # loss computation
-        denoising_loss = None if loss_kwargs["align_only"] else mean_flat((x - model_target) ** 2)
+        denoising_loss = mean_flat((x - model_target) ** 2)
+        eps = 1e-5
+        score_target = get_score_from_velocity(model_target, model_input, time_input, eps=eps)
+        score_output = get_score_from_velocity(x, model_input, time_input, eps=eps)
+        score_norm = torch.sqrt(torch.mean(score_output**2, dim=(1,2,3)) + eps)
+        wsm_loss = torch.sum((2 * time_input / (1 - time_input + eps)) * (score_target - score_output) ** 2, dim=(1,2,3))
+        wsm_loss = torch.mean(wsm_loss)
 
         proj_loss = torch.tensor(0., device=x.device)
         bsz = zs[0].shape[0]
@@ -377,15 +549,27 @@ class SiT(nn.Module):
                 z_j = torch.nn.functional.normalize(z_j, dim=-1) 
                 proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
         proj_loss /= (len(zs) * bsz)
-
-        return {
+        ret_dict = {
             "zs_tilde": zs_tilde,
             "model_output": x,
             "denoising_loss": denoising_loss,
+            "score_norm": score_norm,
+            "wsm_loss": wsm_loss,
             "proj_loss": proj_loss,
             "time_input": time_input,
             "noises": noises,
         }
+        if self.use_flow:
+            ret_dict["z_loss"] = z_loss
+            ret_dict["z_loss_target"] = z_loss_target
+
+        return ret_dict
+
+    def inv_flow(self, x):
+        if self.use_flow:
+            return self.flow.inverse(x)
+        else:
+            return x
 
     @torch.no_grad()
     def inference(self, x, t, y):
@@ -485,6 +669,9 @@ def SiT_XL_1(**kwargs):
 def SiT_XL_2(**kwargs):
     return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
+def SiT_XL_2_flow(**kwargs):
+    return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=2, num_heads=16, use_flow=True, **kwargs)
+
 def SiT_XL_4(**kwargs):
     return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
@@ -533,4 +720,5 @@ SiT_models = {
     'SiT-L/1': SiT_L_1,  'SiT-L/2':  SiT_L_2,   'SiT-L/4':  SiT_L_4,   'SiT-L/8':  SiT_L_8,
     'SiT-B/1': SiT_B_1,  'SiT-B/2':  SiT_B_2,   'SiT-B/4':  SiT_B_4,   'SiT-B/8':  SiT_B_8,
     'SiT-S/1': SiT_S_1,  'SiT-S/2':  SiT_S_2,   'SiT-S/4':  SiT_S_4,   'SiT-S/8':  SiT_S_8,
+    'SiT-XL/2/flow': SiT_XL_2_flow,
 }

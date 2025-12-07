@@ -31,12 +31,12 @@ if __name__ == "__main__":
         "latents_bias": latents_bias,
     }
 
-    # Extract the discriminator weights
-    discriminator_weights = ckpt["discriminator"]
-
     # Finally, save the weights
     save_dir = os.path.join(args.save_dir, args.vae_name)
     os.makedirs(save_dir, exist_ok=True)
     torch.save(vae_weights, os.path.join(save_dir, f"{args.vae_name}.pt"))
     torch.save(latents_stats, os.path.join(save_dir, f"{args.vae_name}-latents-stats.pt"))
-    torch.save(discriminator_weights, os.path.join(save_dir, f"{args.vae_name}-discriminator-ckpt.pt"))
+
+    if "discriminator" in ckpt:
+        discriminator_weights = ckpt["discriminator"]
+        torch.save(discriminator_weights, os.path.join(save_dir, f"{args.vae_name}-discriminator-ckpt.pt"))

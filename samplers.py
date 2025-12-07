@@ -103,6 +103,37 @@ def euler_sampler(
     return x_next
 
 
+def euler_sampler_likelihood(
+        model,
+        latents,
+        y,
+        num_steps=20,
+        cfg_scale=1.0,
+        path_type="linear", # not used, just for compatability
+    ):
+    # setup conditioning
+    if cfg_scale > 1.0:
+        y_null = torch.tensor([1000] * y.size(0), device=y.device)
+    _dtype = latents.dtype    
+    t_steps = torch.linspace(1, 0, num_steps+1, dtype=torch.float64)
+    x_next = latents.to(torch.float64)
+    device = x_next.device
+
+    with torch.no_grad():
+        for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+            x_cur = x_next
+            model_input = x_cur
+            y_cur = y            
+            kwargs = dict(y=y_cur)
+            time_input = torch.ones(model_input.size(0)).to(device=device, dtype=torch.float64) * t_cur
+            d_cur = model.inference(
+                model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
+            ).to(torch.float64)
+            x_next = x_cur + (t_next - t_cur) * d_cur
+
+    return x_next
+
+
 def euler_maruyama_sampler(
         model,
         latents,

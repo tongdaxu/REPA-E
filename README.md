@@ -69,6 +69,31 @@ pretrained/
 └── vavae/
 ```
 
+accelerate launch train_repae.py \
+    --max-train-steps=400000 \
+    --report-to="wandb" \
+    --allow-tf32 \
+    --mixed-precision="fp16" \
+    --seed=0 \
+    --data-dir="data" \
+    --output-dir="exps" \
+    --batch-size=256 \
+    --path-type="linear" \
+    --prediction="v" \
+    --weighting="uniform" \
+    --model="SiT-XL/2" \
+    --checkpointing-steps=50000 \
+    --loss-cfg-path="configs/l1_lpips_kl_gan.yaml" \
+    --vae="f8d4" \
+    --vae-ckpt="/workspace/cogview_dev/xutd/hub_cache/models--REPA-E--sdvae/snapshots/35f7a67ad5f137a6012afc29b03b1248b00e5cfd/sdvae-f8d4.pt" \
+    --disc-pretrained-ckpt="/workspace/cogview_dev/xutd/hub_cache/models--REPA-E--sdvae/snapshots/35f7a67ad5f137a6012afc29b03b1248b00e5cfd/sdvae-f8d4-discriminator-ckpt.pt" \
+    --enc-type="dinov2-vit-b" \
+    --proj-coeff=0.5 \
+    --encoder-depth=8 \
+    --vae-align-proj-coeff=1.5 \
+    --bn-momentum=0.1 \
+    --exp-name="sit-xl-dinov2-b-enc8-repae-sdvae-0.5-1.5-400k"
+  
 Once you've downloaded the VAE checkpoint, you can launch REPA-E training with:
 ```bash
 accelerate launch train_repae.py \
@@ -271,3 +296,8 @@ If you find our work useful, please consider citing:
   journal={arXiv preprint arXiv:2504.10483},
 }
 ```
+
+
+/workspace/cogview_dev/xutd/xu/REPA-E/exps/sit-xl-dinov2-b-enc8-repae-flow-6r-0.1_ttut_40-sdvae-0.5-1.5-400k/checkpoints/0400000.pt
+
+/workspace/cogview_dev/xutd/xu/REPA-E/exps/sit-xl-dinov2-b-enc8-repae-flow-6r-0.1_ttut_40-sdvae-0.5-1.5-400k/export_vae
